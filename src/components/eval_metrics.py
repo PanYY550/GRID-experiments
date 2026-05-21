@@ -135,6 +135,47 @@ class Recall(CustomRetrievalMetric):
             min=1
         )  # Use clamp to avoid zero
         return recall
+
+
+class NDCGPlusHR(CustomRetrievalMetric):
+    """
+    Metric to calculate NDCG@K + HR@K (composite metric as in QuaSID paper).
+    This combines Normalized Discounted Cumulative Gain and Hit Rate (Recall).
+    """
+
+    def _metric(self, preds: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        topk_indices = torch.topk(preds, self.top_k)[1]
+        topk_true = target.gather(1, topk_indices)
+
+        # Compute NDCG component
+        dcg = torch.sum(
+            topk_true
+            / torch.log2(
+                torch.arange(2, self.top_k + 2, device=target.device).unsqueeze(0)
+            ),
+            dim=1,
+        )
+        ideal_indices = torch.topk(target, self.top_k)[1]
+        ideal_dcg = torch.sum(
+            target.gather(1, ideal_indices)
+            / torch.log2(
+                torch.arange(2, self.top_k + 2, device=target.device).unsqueeze(0)
+            ),
+            dim=1,
+        )
+        ndcg = dcg / torch.where(ideal_dcg == 0, torch.ones_like(ideal_dcg), ideal_dcg)
+
+        # Compute HR (Recall) component
+        true_positives = topk_true.sum(dim=1)
+        total_relevant = target.sum(dim=1)
+        hr = true_positives / total_relevant.minimum(
+            torch.tensor(self.top_k, device=self.device)
+        ).clamp(min=1)
+
+        # Return composite metric: NDCG + HR
+        return ndcg + hr
+
+
 ## Evaluators
 
 class Evaluator:
@@ -311,4 +352,112 @@ class SIDRetrievalEvaluator(Evaluator):
                 preds,
                 target.to(preds.device),
                 indexes=expanded_indexes.to(preds.device),
+            )
+
+
+class SelectionRate(CustomMeanReductionMetric):
+    """Tracks selected/total ratio for filtered evaluation."""
+
+    def update(self, selected: int, total: int) -> None:
+        self.metric_values += int(selected)
+        self.total_values += int(total)
+
+
+class TailFilteredSIDRetrievalEvaluator(Evaluator):
+    """
+    SID retrieval evaluator that only updates metrics on a subset of samples whose
+    label semantic IDs appear in an allow-list (e.g., tail items mapped to SIDs).
+
+    Notes:
+    - The allow-list is a tensor of shape (M, num_hierarchies) saved via torch.save.
+    - Metrics are logged under names prefixed with `allowed_label_name`.
+    """
+
+    def __init__(
+        self,
+        metrics: Dict[str, CustomRetrievalMetric],
+        top_k_list: List[int],
+        allowed_labels_path: str,
+        allowed_label_name: str = "tail",
+    ):
+        # Prefix metric keys so they don't collide with the default evaluator
+        self.metrics = {
+            f"{allowed_label_name}_{metric_name}@{top_k}": metric_object(
+                top_k=top_k, sync_on_compute=False, compute_with_cache=False
+            )
+            for metric_name, metric_object in metrics.items()
+            for top_k in top_k_list
+        }
+        self.metrics[f"{allowed_label_name}_selection_rate"] = SelectionRate(
+            sync_on_compute=False, compute_with_cache=False
+        )
+
+        self.allowed_label_name = allowed_label_name
+        self.allowed_labels = torch.load(allowed_labels_path, map_location="cpu")
+        if not isinstance(self.allowed_labels, torch.Tensor):
+            raise TypeError(
+                f"allowed_labels must be a torch.Tensor. got {type(self.allowed_labels)}"
+            )
+        if self.allowed_labels.ndim != 2:
+            raise ValueError(
+                f"allowed_labels must be 2D (M x H). got shape={tuple(self.allowed_labels.shape)}"
+            )
+
+    def __call__(
+        self,
+        marginal_probs: torch.Tensor,
+        generated_ids: torch.Tensor,
+        labels: torch.Tensor,
+        **kwargs,
+    ):
+        batch_size, num_candidates, num_hierarchies = generated_ids.shape
+        labels_2d = labels.reshape(batch_size, num_hierarchies).to("cpu")
+
+        if self.allowed_labels.shape[1] != num_hierarchies:
+            raise ValueError(
+                f"allowed_labels H mismatch: allowed={self.allowed_labels.shape[1]} model={num_hierarchies}"
+            )
+
+        # mask samples where the label SID matches any allow-listed SID
+        # (bs, 1, H) == (1, M, H) -> (bs, M, H) -> (bs, M) -> (bs,)
+        mask = (labels_2d.unsqueeze(1) == self.allowed_labels.unsqueeze(0)).all(
+            dim=2
+        ).any(dim=1)
+
+        selected = int(mask.sum().item())
+        total = int(mask.numel())
+        self.metrics[f"{self.allowed_label_name}_selection_rate"].update(
+            selected=selected, total=total
+        )
+        if selected == 0:
+            return
+
+        # Filter tensors on-device for metric computation
+        mask_dev = mask.to(marginal_probs.device)
+        marginal_probs_f = marginal_probs.reshape(batch_size, num_candidates)[mask_dev]
+        generated_ids_f = generated_ids[mask_dev]
+        labels_f = labels.reshape(batch_size, num_hierarchies)[mask_dev]
+
+        preds = marginal_probs_f.reshape(-1)
+        labels_f = labels_f.reshape(selected, 1, num_hierarchies)
+
+        matched_id_coord = torch.all((generated_ids_f == labels_f), dim=2).nonzero()
+        target = torch.zeros(selected, num_candidates).bool()
+        target[matched_id_coord[:, 0], matched_id_coord[:, 1]] = True
+        target = target.reshape(-1)
+
+        expanded_indexes = (
+            torch.arange(selected, device=preds.device)
+            .unsqueeze(-1)
+            .expand(selected, num_candidates)
+            .reshape(-1)
+        )
+
+        for metric_name, metric_object in self.metrics.items():
+            if metric_name.endswith("_selection_rate"):
+                continue
+            metric_object.update(
+                preds,
+                target.to(preds.device),
+                indexes=expanded_indexes,
             )

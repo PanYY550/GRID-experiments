@@ -146,6 +146,13 @@ def save_metadata_to_local_or_remote(
         f"Saving metadata to {metadata_path}. {metadata.to_dict()}"
     )
 
+    # Ensure parent directory exists for local paths.
+    # (For remote filesystems like gs://, directory creation is handled by the FS implementation.)
+    if "://" not in metadata_path:
+        parent_dir = os.path.dirname(metadata_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+
     # Convert metadata to JSON string
     json_content = json.dumps(metadata.to_dict(), indent=2)
 

@@ -244,7 +244,7 @@ callbacks:
     _target_: lightning.pytorch.callbacks.ModelCheckpoint
     dirpath: ${paths.output_dir}/checkpoints
     filename: checkpoint_{epoch:03d}_{step:06d}
-    monitor: val/recall@5
+    monitor: val/ndcg_plus_hr@5
     verbose: true
     save_last: null
     save_top_k: 1
@@ -258,7 +258,7 @@ callbacks:
   early_stopping:
     _target_: lightning.pytorch.callbacks.EarlyStopping
     monitor: ${callbacks.model_checkpoint.monitor}
-    min_delta: 0.0
+    min_delta: 0.001
     patience: 10
     verbose: true
     mode: ${callbacks.model_checkpoint.mode}
@@ -334,5 +334,8 @@ eval:
         _partial_: true
       recall:
         _target_: src.components.eval_metrics.Recall
+        _partial_: true
+      ndcg_plus_hr:
+        _target_: src.components.eval_metrics.NDCGPlusHR
         _partial_: true
 

@@ -1,0 +1,67 @@
+# @package _global_
+# VCR-TD Inference Configuration
+# 用于加载VCR-TD训练的检查点进行推理
+
+defaults:
+  - rkmeans_inference_flat
+
+data_dir: ???
+embedding_path: ???
+codebook_width: ???
+num_hierarchies: ???
+embedding_dim: ???
+ckpt_path: ???
+seed: 42
+
+model:
+  _target_: src.modules.clustering.residual_quantization.ResidualQuantization
+  track_residuals: true
+  verbose: true
+  train_layer_wise: true
+  normalize_residuals: true
+  input_dim: ${embedding_dim}
+  n_layers: ${num_hierarchies}
+  init_buffer_size: 3072
+  
+  # VCR-TD相关配置（推理时需要，但不计算排斥损失）
+  use_vcr_td: false
+  # TCCL 仅用于训练阶段；推理阶段只导出最终 SID
+  use_tcl: false
+  use_cvpm: true
+  cvpm_temperature: 0.15
+  use_time_decay: false
+  use_dynamic_margin: false
+  alpha: 0.01
+  m0: 0.5
+  lambda_rep: 0.3
+  exposure_counts_path: /home/pyy/GRID/src/data/amazon_data/beauty/exposure_counts.pt
+  
+  quantization_layer:
+    _target_: src.models.modules.clustering.mini_batch_kmeans.MiniBatchKMeans
+    n_clusters: ${codebook_width}
+    n_features: ${model.input_dim}
+    distance_function:
+      _target_: src.components.distance_functions.SquaredEuclideanDistance
+    initializer:
+      _target_: src.components.clustering_initializers.KMeansPlusPlusInitInitializer
+      n_clusters: ${model.quantization_layer.n_clusters}
+      distance_function: ${model.quantization_layer.distance_function}
+      initialize_on_cpu: false
+    init_buffer_size: ${model.init_buffer_size}
+  optimizer: null
+  scheduler: null
+  quantization_layer_list: null
+  training_loop_function:
+    _target_: src.components.training_loop_functions.scale_loss_by_world_size_for_initialization_training_loop
+    _partial_: true
+  loss_function: null
+  evaluator: null
+
+task_name: inference
+id: ${now:%Y-%m-%d}/${now:%H-%M-%S}
+tags:
+- amazon-assign-ids-inference-vcr-td
+train: false
+test: false
+predict: true
+experiment: null

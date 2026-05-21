@@ -1,0 +1,251 @@
+# @package _global_
+# RQ-VAE + VCF Inference Configuration
+# 用于加载RQ-VAE+VCF训练的检查点进行推理
+
+defaults:
+  - rqvae_train_flat
+
+data_dir: ???
+embedding_path: ???
+codebook_width: ???
+num_hierarchies: ???
+embedding_dim: ???
+ckpt_path: ???
+seed: 42
+
+model:
+  _target_: src.modules.clustering.residual_quantization.ResidualQuantization
+  track_residuals: true
+  verbose: true
+  train_layer_wise: false
+  normalize_residuals: false
+  input_dim: ${embedding_dim}
+  n_layers: ${num_hierarchies}
+  init_buffer_size: 3072
+  
+  # RQ-VAE架构组件
+  normalization_layer:
+    _target_: torch.nn.Sequential
+    _args_:
+    - _target_: torch.nn.BatchNorm1d
+      num_features: ${model.input_dim}
+    - _target_: src.models.components.network_blocks.normalize_layer.NormalizeLayer
+  encoder:
+    _target_: src.models.components.network_blocks.mlp.MLP
+    input_dim: ${model.input_dim}
+    hidden_dim_list:
+    - 768
+    - 256
+    - 128
+    output_dim: 64
+    activation:
+      _target_: torch.nn.ReLU
+      _partial_: true
+  decoder:
+    _target_: src.models.components.network_blocks.mlp.MLP
+    input_dim: ${model.encoder.output_dim}
+    hidden_dim_list:
+    - 128
+    - 256
+    - 768
+    output_dim: ${model.input_dim}
+    activation:
+      _target_: torch.nn.ReLU
+      _partial_: true
+  
+  # VCF相关配置（推理时需要，但不计算排斥损失）
+  use_vcr_td: false
+  use_vcf: false  # 推理时关闭VCF排斥
+  use_tcl: false  # 推理时关闭TCCL
+  use_cvpm: true
+  cvpm_temperature: 0.15
+  use_time_decay: false
+  use_dynamic_margin: false
+  alpha: 0.01
+  m0: 0.5
+  lambda_rep: 0.3
+  exposure_counts_path: /home/pyy/GRID/src/data/amazon_data/beauty/exposure_counts.pt
+  hamming_radius: 2
+  severity_beta: 0.5
+  cold_start_threshold: 50
+  enhancement_factor: 0.5
+  lambda_full: 1.0
+  lambda_partial: 0.5
+  min_margin: 0.05
+  max_enhance: 2.0
+  min_severity_partial: 1.1
+  repulsion_warmup_steps: 1000
+  
+  quantization_layer:
+    _target_: src.modules.clustering.vector_quantization.VectorQuantization
+    n_clusters: ${codebook_width}
+    n_features: ${model.encoder.output_dim}
+    distance_function:
+      _target_: src.components.distance_functions.SquaredEuclideanDistance
+    quantization_strategy:
+      _target_: src.components.quantization_strategies.STEQuantization
+      distance_function: ${model.quantization_layer.distance_function}
+      compute_reconstruction_loss_embeddings: true
+    initializer:
+      _target_: src.components.clustering_initializers.ClusteringModuleInitializer
+      n_clusters: ${model.quantization_layer.n_clusters}
+      initialize_on_cpu: false
+      clustering_module:
+        _target_: src.models.modules.clustering.mini_batch_kmeans.MiniBatchKMeans
+        n_clusters: ${model.quantization_layer.n_clusters}
+        n_features: ${model.quantization_layer.n_features}
+        distance_function: ${model.quantization_layer.distance_function}
+        initializer:
+          _target_: src.components.clustering_initializers.KMeansPlusPlusInitInitializer
+          n_clusters: ${model.quantization_layer.n_clusters}
+          distance_function: ${model.quantization_layer.distance_function}
+          initialize_on_cpu: false
+        init_buffer_size: ${model.init_buffer_size}
+        update_manually: true
+      max_iter: 1000
+    init_buffer_size: ${model.init_buffer_size}
+    loss_function:
+      _target_: src.components.loss_functions.BetaQuantizationLoss
+      beta: 0.25
+      reduction: mean
+    optimizer: null
+  reconstruction_loss_function:
+    _target_: torch.nn.MSELoss
+    reduction: mean
+  reconstruction_loss_weight: 1.0
+  optimizer: null
+  scheduler: null
+  quantization_layer_list: null
+  training_loop_function:
+    _target_: src.components.training_loop_functions.scale_loss_by_world_size_for_initialization_training_loop
+    _partial_: true
+  loss_function: null
+  evaluator: null
+
+task_name: inference
+id: ${now:%Y-%m-%d}/${now:%H-%M-%S}
+tags:
+- amazon-assign-ids-inference
+- rqvae-vcf
+train: false
+test: false
+predict: true
+experiment: null
+callbacks:
+  bq_writer:
+    table_id: ???
+  pickle_writer:
+    _target_: src.utils.inference_utils.LocalPickleWriter
+    output_dir: ${paths.output_dir}/pickle
+    flush_frequency: 100000
+    write_interval: batch
+    should_merge_files_on_main: true
+    prediction_key_name: item_id
+    prediction_name: cluster_ids
+    post_processing_functions:
+    # Append one extra "de-dup digit" to resolve SID collisions.
+    - function:
+        _target_: src.utils.tensor_utils.deduplicate_rows_in_tensor
+        _partial_: true
+      main_only: true
+    - function:
+        _target_: src.utils.tensor_utils.transpose_tensor_from_file
+        _partial_: true
+      main_only: true
+paths:
+  root_dir: .
+  data_dir: ${data_dir}
+  log_dir: ${paths.root_dir}/logs
+  output_dir: ${hydra:runtime.output_dir}
+  work_dir: ${hydra:runtime.cwd}
+  profile_dir: ${hydra:run.dir}/profile_output
+  metadata_dir: ${paths.output_dir}/metadata
+# Add predict_dataloader_config (copied from test_dataloader_config in rqvae_train_flat.yaml)
+data_loading:
+  datamodule:
+    # In inference we only need the predict stage. If train/val/test configs are inherited
+    # from training experiments, the datamodule may not initialize the predict file map correctly.
+    train_dataloader_config: null
+    val_dataloader_config: null
+    test_dataloader_config: null
+    predict_dataloader_config:
+      _target_: src.data.loading.components.interfaces.ItemDataloaderConfig
+      dataset_class:
+        _target_: src.data.loading.components.dataloading.UnboundedSequenceIterable
+        _partial_: true
+      data_folder: ${paths.data_dir}/items
+      should_shuffle_rows: false
+      batch_size_per_device: 256
+      num_workers: 2
+      assign_files_by_size: true
+      timeout: 60
+      drop_last: false
+      pin_memory: false
+      persistent_workers: true
+      collate_fn:
+        _target_: src.data.loading.components.collate_functions.collate_fn_items
+        _partial_: true
+        item_id_field: id
+        feature_to_input_name:
+          id: item_ids
+          text: text_tokens
+          text_mask: text_mask
+          embedding: input_embedding
+      dataset_config:
+        _target_: src.data.loading.components.interfaces.ItemDatasetConfig
+        item_id_field: id
+        keep_item_id: true
+        iterate_per_row: true
+        data_iterator:
+          _target_: src.data.loading.components.iterators.TFRecordIterator
+        features_to_consider:
+        - id
+        embedding_map:
+          id:
+            _target_: torch.load
+            _args_:
+            - _target_: src.utils.file_utils.open_local_or_remote
+              file_path: ${embedding_path}
+              mode: rb
+        num_placeholder_tokens_map:
+          id: 0
+        preprocessing_functions:
+        - _target_: src.data.loading.components.pre_processing.filter_features_to_consider
+          _partial_: true
+        - _target_: src.data.loading.components.pre_processing.convert_to_dense_numpy_array
+          _partial_: true
+        - _target_: src.data.loading.components.pre_processing.convert_fields_to_tensors
+          _partial_: true
+        - _target_: src.data.loading.components.pre_processing.map_sparse_id_to_embedding
+          _partial_: true
+          sparse_id_field: id
+          embedding_field_to_add: embedding
+        field_type_map:
+          id:
+            _target_: torch.__dict__.get
+            _args_:
+            - int32
+      limit_files: null
+
+logger:
+  csv:
+    _target_: lightning.pytorch.loggers.csv_logs.CSVLogger
+    save_dir: ${paths.output_dir}
+    name: csv/
+    prefix: ''
+trainer:
+  _target_: lightning.pytorch.trainer.Trainer
+  default_root_dir: ${paths.output_dir}
+  min_steps: 1
+  max_steps: 80000
+  max_epochs: 10
+  accelerator: gpu
+  devices: -1
+  num_nodes: 1
+  precision: bf16-mixed
+  log_every_n_steps: 2500
+  val_check_interval: 5000
+  deterministic: false
+  accumulate_grad_batches: 1
+  profiler:
+    _target_: lightning.pytorch.profilers.PassThroughProfiler

@@ -1,5 +1,8 @@
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from collections import Counter, defaultdict
+import os
+
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
@@ -11,6 +14,78 @@ from src.data.loading.components.interfaces import (
 from src.data.loading.utils import combine_list_of_tensor_dicts, pad_or_trim_sequence
 from src.utils.tensor_utils import extract_locations
 from src.data.loading.components.interfaces import ItemData
+from src.utils.file_utils import list_files
+
+
+_COOCCURRENCE_CACHE: Dict[Tuple[str, int, str, str], Dict[int, set[int]]] = {}
+
+
+def _build_item_cooccurrence_from_tfrecord_sequences(
+    *,
+    sequences_dir: str,
+    sequence_field: str,
+    file_glob: str,
+    topk: int,
+) -> Dict[int, set[int]]:
+    """Build item->set(co-occurred items) from TFRecord user sequences."""
+    # Lazy import to avoid importing tensorflow in environments that don't need it.
+    import tensorflow as tf  # type: ignore
+
+    file_paths = list_files(folder_path=sequences_dir, suffix=file_glob)
+    if not file_paths:
+        raise FileNotFoundError(
+            f"No TFRecord files found in {sequences_dir!r} with pattern {file_glob!r}"
+        )
+
+    feature_description = {sequence_field: tf.io.VarLenFeature(tf.int64)}
+    raw_dataset = tf.data.TFRecordDataset(file_paths, compression_type="GZIP")
+
+    co_counts: Dict[int, Counter] = defaultdict(Counter)
+    for record in raw_dataset:
+        ex = tf.io.parse_single_example(record, feature_description)
+        dense = tf.sparse.to_dense(ex[sequence_field], default_value=-1).numpy()
+        seq = [int(x) for x in dense.tolist() if int(x) >= 0]
+        if len(seq) < 2:
+            continue
+        # Deduplicate within a user to avoid overweighting repeats.
+        uniq = list(dict.fromkeys(seq))
+        if len(uniq) < 2:
+            continue
+        for i, iid_i in enumerate(uniq):
+            for j, iid_j in enumerate(uniq):
+                if i == j:
+                    continue
+                co_counts[int(iid_i)][int(iid_j)] += 1
+
+    co: Dict[int, set[int]] = {}
+    for iid, ctr in co_counts.items():
+        if topk > 0:
+            neighbors = [j for j, _ in ctr.most_common(topk)]
+        else:
+            neighbors = list(ctr.keys())
+        co[int(iid)] = set(int(x) for x in neighbors)
+    return co
+
+
+def _get_or_build_cooccurrence(
+    *,
+    sequences_dir: str,
+    sequence_field: str,
+    file_glob: str,
+    topk: int,
+) -> Dict[int, set[int]]:
+    key = (os.path.abspath(sequences_dir), int(topk), str(sequence_field), str(file_glob))
+    cached = _COOCCURRENCE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    built = _build_item_cooccurrence_from_tfrecord_sequences(
+        sequences_dir=sequences_dir,
+        sequence_field=sequence_field,
+        file_glob=file_glob,
+        topk=topk,
+    )
+    _COOCCURRENCE_CACHE[key] = built
+    return built
 
 def identity_collate_fn(batch: Any) -> Any:
     """The default collate function that does nothing."""
@@ -284,6 +359,12 @@ def collate_fn_items(
     batch: Union[List[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]],
     item_id_field: str,
     feature_to_input_name: Dict[str, str],  # type: ignore
+    # === VCR-TD v2.0 / TCCL real positives ===
+    build_positive_pair_matrix: bool = False,
+    cooccurrence_sequences_dir: Optional[str] = None,
+    cooccurrence_sequence_field: str = "sequence_data",
+    cooccurrence_file_glob: str = "*tfrecord.gz",
+    cooccurrence_topk: int = 50,
 ) -> ItemData:
     """The collate function passed to the item dataloader.
 
@@ -314,14 +395,54 @@ def collate_fn_items(
     for field_name, field_value in batch.items():  # type: ignore
         if field_name == item_id_field:
             model_input_data.item_ids = list(field_value)
-
         else:
-            # In this case, field_value is a list of tensors, each representing the
-            # features of a single item. We stack these tensors along the batch
-            # dimension to create a single tensor for the batch of items.
             field_value = torch.stack(field_value, dim=0)
             model_input_data.transformed_features[
                 feature_to_input_name[field_name]
             ] = field_value
+
+    if build_positive_pair_matrix:
+        if cooccurrence_sequences_dir is None:
+            raise ValueError(
+                "build_positive_pair_matrix=True requires cooccurrence_sequences_dir"
+            )
+
+        co = _get_or_build_cooccurrence(
+            sequences_dir=cooccurrence_sequences_dir,
+            sequence_field=cooccurrence_sequence_field,
+            file_glob=cooccurrence_file_glob,
+            topk=cooccurrence_topk,
+        )
+
+        item_ids = model_input_data.item_ids
+        if not isinstance(item_ids, torch.Tensor):
+            item_ids_t = torch.tensor(item_ids, dtype=torch.long)
+        else:
+            item_ids_t = item_ids.to(dtype=torch.long)
+
+        bsz = int(item_ids_t.shape[0])
+        ppm = torch.zeros((bsz, bsz), dtype=torch.float32)
+
+        batch_items_set = set(int(x) for x in item_ids_t.tolist())
+        id_to_indices: Dict[int, List[int]] = defaultdict(list)
+        for idx, iid in enumerate(item_ids_t.tolist()):
+            id_to_indices[int(iid)].append(idx)
+
+        for iid_i, idxs_i in id_to_indices.items():
+            neigh = co.get(int(iid_i))
+            if not neigh:
+                continue
+            hits = batch_items_set.intersection(neigh)
+            if not hits:
+                continue
+            for iid_j in hits:
+                for ii in idxs_i:
+                    for jj in id_to_indices[int(iid_j)]:
+                        if ii != jj:
+                            ppm[ii, jj] = 1.0
+
+        ppm = ((ppm + ppm.t()) > 0).to(dtype=torch.float32)
+        ppm.fill_diagonal_(0.0)
+        model_input_data.positive_pair_matrix = ppm
 
     return model_input_data

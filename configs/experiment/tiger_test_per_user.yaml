@@ -1,0 +1,35 @@
+# @package _global_
+# TIGER test-only config with per-user prediction collection.
+#
+# Usage:
+#   python src/train.py experiment=tiger_test_per_user \
+#       data_dir=... semantic_id_path=... num_hierarchies=... ckpt_path=...
+
+defaults:
+  - tiger_train_flat
+
+train: false
+test: true
+ckpt_path: ???
+
+callbacks:
+  model_checkpoint: null
+  early_stopping: null
+  restart_job: null
+  model_summary:
+    _target_: lightning.pytorch.callbacks.RichModelSummary
+    max_depth: -1
+  per_user_preds:
+    _target_: src.utils.inference_utils.PerUserPredictionCollector
+    output_dir: ${paths.output_dir}/per_user_preds
+    write_interval: batch
+    flush_frequency: 1000
+
+trainer:
+  devices: 1
+  strategy: auto
+  max_steps: -1
+  max_epochs: 1
+  val_check_interval: null
+  accumulate_grad_batches: 1
+  sync_batchnorm: false

@@ -192,3 +192,17 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Experiment outputs (too large for GitHub)
+outputs/
+logs/
+embeddings/
+checkpoints/
+
+# Large data files
+src/data/amazon_data/
+src/data/amazon_data.zip
+src/data/__MACOSX/
+
+# Project marker
+.project-root

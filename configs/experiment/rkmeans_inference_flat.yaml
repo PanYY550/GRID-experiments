@@ -41,6 +41,9 @@ task_name: inference
 id: ${now:%Y-%m-%d}/${now:%H-%M-%S}
 tags:
 - amazon-assign-ids-inference
+train: false
+test: false
+predict: true
 experiment: null
 callbacks:
   bq_writer:
@@ -54,6 +57,9 @@ callbacks:
     prediction_key_name: item_id
     prediction_name: cluster_ids
     post_processing_functions:
+    # Append one extra "de-dup digit" to resolve SID collisions.
+    # This makes the final semantic-id tensor shape (num_hierarchies + 1, N),
+    # matching the README/TIGER convention.
     - function:
         _target_: src.utils.tensor_utils.deduplicate_rows_in_tensor
         _partial_: true

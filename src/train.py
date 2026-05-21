@@ -57,19 +57,30 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             )
         train_metrics = pipeline_modules.trainer.callback_metrics
 
+        if cfg.get("predict"):
+            command_line_logger.info("Starting prediction!")
+            pipeline_modules.trainer.predict(
+                model=pipeline_modules.model,
+                datamodule=pipeline_modules.datamodule,
+                ckpt_path=cfg.get("ckpt_path"),
+            )
+
         if cfg.get("test"):
             command_line_logger.info("Starting testing!")
-            ckpt_path = None
+            ckpt_path = cfg.get("ckpt_path")
+            if ckpt_path in ("", "null"):
+                ckpt_path = None
             # Check if a checkpoint callback is available and if it has a best model path.
             # Note that if multiple checkpoint callbacks are used, only the first one will be used
             # to determine the best model path for testing.
-            checkpoint_callback = getattr(
-                pipeline_modules.trainer, "checkpoint_callback", None
-            )
-            if checkpoint_callback:
-                ckpt_path = getattr(checkpoint_callback, "best_model_path", None)
-                if ckpt_path == "":
-                    ckpt_path = None
+            if not ckpt_path:
+                checkpoint_callback = getattr(
+                    pipeline_modules.trainer, "checkpoint_callback", None
+                )
+                if checkpoint_callback:
+                    ckpt_path = getattr(checkpoint_callback, "best_model_path", None)
+                    if ckpt_path == "":
+                        ckpt_path = None
             if not ckpt_path:
                 command_line_logger.warning(
                     "Best checkpoint not found! Using current weights for testing..."

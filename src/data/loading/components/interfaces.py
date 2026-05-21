@@ -347,6 +347,8 @@ class ItemData:
 
     item_ids: Union[torch.Tensor, List[str], None] = None
     transformed_features: Dict[str, torch.Tensor] = field(default_factory=dict)
+    # Optional collaborative positives for losses like TCCL
+    positive_pair_matrix: Optional[torch.Tensor] = None
 
 
 @dataclass

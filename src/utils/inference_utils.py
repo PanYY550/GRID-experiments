@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Union
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
+import torch.distributed as dist
 from google.cloud import bigquery
 
 from lightning import LightningModule, Trainer
@@ -17,6 +18,11 @@ from src.utils.decorators import RetriesFailedException, retry
 from src.utils.tensor_utils import merge_list_of_keyed_tensors_to_single_tensor
 
 log = logging.getLogger(__name__)
+
+
+def is_distributed_available():
+    """检查分布式环境是否可用且已初始化"""
+    return dist.is_available() and dist.is_initialized()
 
 
 class BaseBufferedWriter(BasePredictionWriter):
@@ -233,15 +239,15 @@ class LocalPickleWriter(BaseBufferedWriter):
         if self.should_merge_files_on_main:
             # if we use multiple workers, we need to wait for all of them to finish writing
             # before merging the files
-            if trainer.global_rank != None:
-                torch.distributed.barrier()
+            if is_distributed_available():
+                dist.barrier()
             if self.global_rank == 0:
                 log.info("Merging pickle files on main process.")
                 self._merge_files()
 
             # other processes can continue after merging
-            if trainer.global_rank != None:
-                torch.distributed.barrier()
+            if is_distributed_available():
+                dist.barrier()
 
         # conducting post-processing functions on the files
         for process_func in self.post_processing_functions:
@@ -253,8 +259,8 @@ class LocalPickleWriter(BaseBufferedWriter):
                         process_func["function"](file_path)
                 else:
                     process_func["function"](file_path)
-                if trainer.global_rank != None:
-                    torch.distributed.barrier()
+                if is_distributed_available():
+                    dist.barrier()
 
     def _merge_files(self):
         """Merge all pickle files in the output directory into a single file."""
@@ -280,4 +286,141 @@ class LocalPickleWriter(BaseBufferedWriter):
             )
         log.info(
             f"Merged {len(merged_data_tensor)} rows into merged_predictions_tensor.pt. as pytorch tensor"
+        )
+
+
+class PerUserPredictionCollector(BasePredictionWriter):
+    """
+    Callback to collect per-user predictions during test mode.
+
+    Saves (user_id, predicted_SID_tokens, ground_truth_SID_tokens) for each
+    test user, enabling per-item hit-rate analysis.
+
+    Unlike LocalPickleWriter which hooks predict_step, this hooks test_step
+    and re-runs generate() to extract per-user predictions alongside GT labels.
+
+    Output format per row:
+        {
+            'user_id': int,
+            'predicted_sids': np.ndarray of shape (top_k, num_hierarchies),
+            'gt_sid': np.ndarray of shape (num_hierarchies,),
+        }
+    """
+
+    def __init__(
+        self,
+        output_dir: str,
+        flush_frequency: int = 1000,
+        write_interval: str = "batch",
+        should_merge_files_on_main: bool = True,
+        **kwargs,
+    ):
+        super().__init__(write_interval=write_interval)
+        self.output_dir = output_dir
+        self.flush_frequency = flush_frequency
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.buffer: List[dict] = []
+        self.global_rank = 0
+        self.should_merge_files_on_main = should_merge_files_on_main
+
+    def setup(self, trainer: Trainer, pl_module: LightningModule, stage: str) -> None:
+        self.global_rank = trainer.global_rank if trainer.global_rank else 0
+        log.info(
+            f"PerUserPredictionCollector: Rank {self.global_rank} initialized."
+        )
+
+    def _create_file_path(self) -> str:
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y%m%dT%H%M%S%f"
+        )[:-3]
+        return f"per_user_preds_{self.global_rank}_{ts}.pkl"
+
+    def _flush_buffer(self) -> None:
+        if not self.buffer:
+            return
+        file_path = os.path.join(self.output_dir, self._create_file_path())
+        with open(file_path, "wb") as f:
+            pickle.dump(self.buffer, f)
+        log.info(
+            f"Rank {self.global_rank}: flushed {len(self.buffer)} rows to {file_path}"
+        )
+        self.buffer.clear()
+
+    def on_test_batch_end(
+        self,
+        trainer: Trainer,
+        pl_module: LightningModule,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        model_input = batch[0]
+        label_data = batch[1]
+
+        # Re-run generate to capture per-user predictions.
+        # eval_step already called generate() once; this is a second call.
+        with torch.no_grad():
+            generated_ids, _ = pl_module.generate(
+                attention_mask=model_input.mask,
+                **{
+                    pl_module.feature_to_model_input_map.get(k, k): v
+                    for k, v in model_input.transformed_sequences.items()
+                },
+            )
+
+        # GT SIDs: flat (batch_size * num_hierarchies,) → reshape
+        num_hierarchies = generated_ids.shape[-1]
+        gt_sids = list(label_data.labels.values())[0].cpu()
+        gt_sids = gt_sids.reshape(-1, num_hierarchies)
+
+        user_ids = model_input.user_id_list
+        if user_ids is None:
+            # collate_fn_train doesn't set user_id_list; extract from transformed sequences
+            user_ids_seq = model_input.transformed_sequences.get("user_id")
+            if user_ids_seq is not None:
+                user_ids = user_ids_seq[:, 0]  # first element of each row is the user_id
+        if user_ids is None:
+            log.warning("No user_id_list or user_id field found. Skipping batch.")
+            return
+
+        for i, uid in enumerate(user_ids):
+            uid_val = uid.item() if isinstance(uid, torch.Tensor) else uid
+            self.buffer.append({
+                "user_id": uid_val,
+                "predicted_sids": generated_ids[i].cpu().numpy().copy(),
+                "gt_sid": gt_sids[i].numpy().copy(),
+            })
+
+        if len(self.buffer) >= self.flush_frequency:
+            self._flush_buffer()
+
+    def on_test_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        self._flush_buffer()
+
+        if self.should_merge_files_on_main:
+            if is_distributed_available():
+                dist.barrier()
+            if self.global_rank == 0:
+                self._merge_files()
+            if is_distributed_available():
+                dist.barrier()
+
+    def _merge_files(self) -> None:
+        all_files = [
+            f for f in os.listdir(self.output_dir)
+            if f.startswith("per_user_preds_") and f.endswith(".pkl")
+        ]
+        merged = []
+        for fname in all_files:
+            fpath = os.path.join(self.output_dir, fname)
+            with open(fpath, "rb") as f:
+                merged.extend(pickle.load(f))
+            os.remove(fpath)
+
+        merged_path = os.path.join(self.output_dir, "merged_per_user_preds.pkl")
+        with open(merged_path, "wb") as f:
+            pickle.dump(merged, f)
+        log.info(
+            f"Merged {len(merged)} per-user predictions into merged_per_user_preds.pkl"
         )

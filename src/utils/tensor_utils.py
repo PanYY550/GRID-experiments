@@ -107,18 +107,33 @@ def merge_list_of_keyed_tensors_to_single_tensor(
         index_key (str): The key in the dictionary that contains the index for each row.
         value_key (str): The key in the dictionary that contains the tensor to be merged.
     """
-    batch_size = len(data)
-    dimensions = torch.tensor(data[0][value_key]).size()
-    output_tensor = torch.zeros((batch_size, *dimensions))
+    # For inference, `index_key` is often a sparse id (e.g. item_id) and batches may contain
+    # duplicates (or not be contiguous). We therefore size the output tensor using max(index)+1
+    # so that downstream indexing `id_map.t()[item_id]` is valid and stable.
+    if len(data) == 0:
+        raise ValueError("merge_list_of_keyed_tensors_to_single_tensor got empty data")
+
+    # Determine output shape
+    first_value = torch.as_tensor(data[0][value_key])
+    dimensions = first_value.size()
+
+    # Determine max index across rows
+    max_index = -1
     for row in data:
-        index = row[index_key]
-        value = row[value_key]
-        if index < batch_size:
-            output_tensor[index] = torch.tensor(value)
-        else:
-            raise IndexError(
-                f"Index {index} out of bounds for batch size {batch_size}."
-            )
+        idx = int(torch.as_tensor(row[index_key]).item())
+        if idx > max_index:
+            max_index = idx
+    if max_index < 0:
+        raise ValueError("All indices were negative in merge_list_of_keyed_tensors_to_single_tensor")
+
+    output_tensor = torch.zeros((max_index + 1, *dimensions), dtype=first_value.dtype)
+
+    # Fill; duplicates overwrite (should be identical in well-formed inference outputs)
+    for row in data:
+        index = int(torch.as_tensor(row[index_key]).item())
+        value = torch.as_tensor(row[value_key], dtype=first_value.dtype)
+        output_tensor[index] = value
+
     return output_tensor
 
 
